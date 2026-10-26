@@ -81,6 +81,7 @@ func getRecentWrite(ctx context.Context, storage driver.Driver, dirPath, name st
 }
 
 func updateCacheObj(storage driver.Driver, path string, oldObj model.Obj, newObj model.Obj) {
+	invalidatePageCache(storage)
 	key := Key(storage, path)
 	objs, ok := listCache.Get(key)
 	if ok {
@@ -101,6 +102,7 @@ func updateCacheObj(storage driver.Driver, path string, oldObj model.Obj, newObj
 }
 
 func delCacheObj(storage driver.Driver, path string, obj model.Obj) {
+	invalidatePageCache(storage)
 	key := Key(storage, path)
 	objs, ok := listCache.Get(key)
 	if ok {
@@ -117,6 +119,7 @@ func delCacheObj(storage driver.Driver, path string, obj model.Obj) {
 var addSortDebounceMap generic_sync.MapOf[string, func(func())]
 
 func addCacheObj(storage driver.Driver, path string, newObj model.Obj) {
+	invalidatePageCache(storage)
 	key := Key(storage, path)
 	objs, ok := listCache.Get(key)
 	if ok {
@@ -149,6 +152,7 @@ func addCacheObj(storage driver.Driver, path string, newObj model.Obj) {
 }
 
 func ClearCache(storage driver.Driver, path string) {
+	invalidatePageCache(storage)
 	objs, ok := listCache.Get(Key(storage, path))
 	if ok {
 		for _, obj := range objs {
@@ -171,6 +175,9 @@ func List(ctx context.Context, storage driver.Driver, path string, args model.Li
 	}
 	path = utils.FixAndCleanPath(path)
 	log.Debugf("op.List %s", path)
+	if args.Refresh {
+		invalidatePageCache(storage)
+	}
 	key := Key(storage, path)
 	if !args.Refresh {
 		if files, ok := listCache.Get(key); ok {
@@ -236,6 +243,9 @@ func Get(ctx context.Context, storage driver.Driver, path string) (model.Obj, er
 		obj, err := g.Get(ctx, path)
 		if err == nil {
 			return model.WrapObjName(obj), nil
+		}
+		if _, paged := storage.(driver.PagedReader); paged && !(utils.PathEqual(path, "/") && errors.Is(err, errs.NotImplement)) {
+			return nil, err
 		}
 	}
 
@@ -408,6 +418,9 @@ func MakeDir(ctx context.Context, storage driver.Driver, path string, lazyCache 
 				default:
 					return nil, errs.NotImplement
 				}
+				if err == nil {
+					invalidatePageCache(storage)
+				}
 				return nil, errors.WithStack(err)
 			}
 			return nil, errors.WithMessage(err, "failed to check if dir exists")
@@ -474,6 +487,9 @@ func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 	default:
 		return errs.NotImplement
 	}
+	if err == nil {
+		invalidatePageCache(storage)
+	}
 	return errors.WithStack(err)
 }
 
@@ -514,6 +530,9 @@ func Rename(ctx context.Context, storage driver.Driver, srcPath, dstName string,
 		}
 	default:
 		return errs.NotImplement
+	}
+	if err == nil {
+		invalidatePageCache(storage)
 	}
 	return errors.WithStack(err)
 }
@@ -562,6 +581,9 @@ func Copy(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 	default:
 		return errs.NotImplement
 	}
+	if err == nil {
+		invalidatePageCache(storage)
+	}
 	return errors.WithStack(err)
 }
 
@@ -598,6 +620,9 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 		}
 	default:
 		return errs.NotImplement
+	}
+	if err == nil {
+		invalidatePageCache(storage)
 	}
 	return errors.WithStack(err)
 }
@@ -693,6 +718,9 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 			}
 		}
 	}
+	if err == nil {
+		invalidatePageCache(storage)
+	}
 	return errors.WithStack(err)
 }
 
@@ -733,5 +761,8 @@ func PutURL(ctx context.Context, storage driver.Driver, dstDirPath, dstName, url
 		return errs.NotImplement
 	}
 	log.Debugf("put url [%s](%s) done", dstName, url)
+	if err == nil {
+		invalidatePageCache(storage)
+	}
 	return errors.WithStack(err)
 }

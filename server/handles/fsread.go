@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/alist-org/alist/v3/internal/conf"
+	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/fs"
 	"github.com/alist-org/alist/v3/internal/model"
@@ -21,9 +22,11 @@ import (
 
 type ListReq struct {
 	model.PageReq
-	Path     string `json:"path" form:"path"`
-	Password string `json:"password" form:"password"`
-	Refresh  bool   `json:"refresh"`
+	Path           string `json:"path" form:"path"`
+	Password       string `json:"password" form:"password"`
+	Refresh        bool   `json:"refresh"`
+	OrderBy        string `json:"order_by"`
+	OrderDirection string `json:"order_direction"`
 }
 
 type DirReq struct {
@@ -50,17 +53,19 @@ type ObjResp struct {
 }
 
 type FsListResp struct {
-	Content       []ObjLabelResp `json:"content"`
-	Total         int64          `json:"total"`
-	FilteredTotal int64          `json:"filtered_total"`
-	Page          int            `json:"page"`
-	PerPage       int            `json:"per_page"`
-	HasMore       bool           `json:"has_more"`
-	PagesTotal    int            `json:"pages_total"`
-	Readme        string         `json:"readme"`
-	Header        string         `json:"header"`
-	Write         bool           `json:"write"`
-	Provider      string         `json:"provider"`
+	SourcePagination bool           `json:"source_pagination"`
+	TotalExact       bool           `json:"total_exact"`
+	Content          []ObjLabelResp `json:"content"`
+	Total            int64          `json:"total"`
+	FilteredTotal    int64          `json:"filtered_total"`
+	Page             int            `json:"page"`
+	PerPage          int            `json:"per_page"`
+	HasMore          bool           `json:"has_more"`
+	PagesTotal       int            `json:"pages_total"`
+	Readme           string         `json:"readme"`
+	Header           string         `json:"header"`
+	Write            bool           `json:"write"`
+	Provider         string         `json:"provider"`
 }
 
 type ObjLabelResp struct {
@@ -93,6 +98,7 @@ func FsList(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
+	requestedPerPage := req.PerPage
 	effPage, effPerPage := normalizeListPage(req.Page, req.PerPage)
 	req.Page = effPage
 	req.PerPage = effPerPage
@@ -124,6 +130,13 @@ func FsList(c *gin.Context) {
 	if storageErr == nil {
 		provider = storage.GetStorage().Driver
 	}
+	if _, paged := storage.(driver.PagedReader); paged {
+		if requestedPerPage <= 0 {
+			req.PerPage = 50
+		}
+		respondSourcePage(c, reqPath, req, user, meta, perm, provider)
+		return
+	}
 	objs, err := fs.List(c, reqPath, &fs.ListArgs{Refresh: req.Refresh})
 	if err != nil {
 		common.ErrorResp(c, err, 500)
@@ -142,6 +155,7 @@ func FsList(c *gin.Context) {
 	hasMore := req.PerPage != AllPerPage && req.Page*req.PerPage < total
 
 	common.SuccessResp(c, FsListResp{
+		TotalExact:    true,
 		Content:       respContent,
 		Total:         int64(total),
 		FilteredTotal: int64(total),
@@ -344,6 +358,7 @@ type FsGetReq struct {
 }
 
 type FsGetResp struct {
+	SourcePagination bool `json:"source_pagination"`
 	ObjResp
 	RawURL   string         `json:"raw_url"`
 	Readme   string         `json:"readme"`
@@ -444,14 +459,18 @@ func FsGet(c *gin.Context) {
 	}
 	var related []model.Obj
 	parentPath := stdpath.Dir(reqPath)
-	sameLevelFiles, err := fs.List(c, parentPath, &fs.ListArgs{})
-	if err == nil {
-		related = filterRelated(sameLevelFiles, obj)
+	_, sourcePagination := storage.(driver.PagedReader)
+	if !sourcePagination {
+		sameLevelFiles, err := fs.List(c, parentPath, &fs.ListArgs{})
+		if err == nil {
+			related = filterRelated(sameLevelFiles, obj)
+		}
 	}
 	parentMeta, _ := op.GetNearestMeta(parentPath)
 	thumb, _ := model.GetThumb(obj)
 	storageClass, _ := model.GetStorageClass(obj)
 	common.SuccessResp(c, FsGetResp{
+		SourcePagination: sourcePagination,
 		ObjResp: ObjResp{
 			Id:           obj.GetID(),
 			Path:         obj.GetPath(),
