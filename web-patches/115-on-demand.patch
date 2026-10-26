@@ -1,0 +1,659 @@
+diff --git a/scripts/paging.test.mjs b/scripts/paging.test.mjs
+new file mode 100644
+index 0000000..4c67f25
+--- /dev/null
++++ b/scripts/paging.test.mjs
+@@ -0,0 +1,105 @@
++import { strict as assert } from "node:assert"
++import { test } from "node:test"
++import ts from "typescript"
++import { readFileSync } from "node:fs"
++const source = readFileSync(
++  new URL("../src/utils/paging.ts", import.meta.url),
++  "utf8",
++)
++const compiled = ts.transpileModule(source, {
++  compilerOptions: { module: ts.ModuleKind.ESNext },
++}).outputText
++const { boundedPageSize, listPageState, pagingMode, sortRequest, canLoadMore } =
++  await import(
++    `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`
++  )
++
++test("all/auto become manual only for source pagination", () => {
++  for (const mode of ["all", "auto_load_more", "load_more", "pagination"]) {
++    assert.equal(pagingMode(true, mode), "pagination")
++    assert.equal(pagingMode(false, mode), mode)
++  }
++  assert.equal(boundedPageSize(-1), 50)
++  assert.equal(boundedPageSize(1000), 500)
++  assert.equal(boundedPageSize(100), 100)
++})
++test("server-clamped page size and page are authoritative", () => {
++  const state = listPageState(
++    { page: 2, per_page: 50, total: 500, has_more: true },
++    8,
++    -1,
++  )
++  assert.equal(state.page, 2)
++  assert.equal(state.perPage, 50)
++  assert.equal(state.hasMore, true)
++})
++test("empty filtered pages retain next; raw total is not exact", () => {
++  const state = listPageState(
++    {
++      page: 3,
++      per_page: 50,
++      filtered_total: 1000,
++      total_exact: false,
++      has_more: true,
++      content: [],
++    },
++    3,
++    50,
++  )
++  assert.equal(state.hasMore, true)
++  assert.equal(state.totalExact, false)
++  assert.equal(
++    listPageState({ has_more: false, total: 1000 }, 3, 50).hasMore,
++    false,
++  )
++})
++test("sort parameters use upstream names and direction; no source prefetch", () => {
++  assert.deepEqual(sortRequest({ orderBy: "modified", reverse: true }), {
++    order_by: "modified",
++    order_direction: "desc",
++  })
++  assert.deepEqual(sortRequest({ orderBy: "size", reverse: false }), {
++    order_by: "size",
++    order_direction: "asc",
++  })
++  assert.deepEqual(sortRequest(), {})
++  assert.equal(canLoadMore(true, true, true), false)
++  assert.equal(canLoadMore(false, true, true), true)
++  assert.equal(canLoadMore(false, false, true), false)
++})
++test("integration guards: sort only on user action, reset history, keep source order", () => {
++  const read = (path) =>
++    readFileSync(new URL(`../src/${path}`, import.meta.url), "utf8")
++  const list = read("pages/home/folder/List.tsx")
++  assert.match(
++    list,
++    /setSortPreference\(orderBy\(\)!, reverse\(\), getCurrentPath\(\)\)/,
++  )
++  assert.match(
++    list,
++    /setSearchParams\(\{ page: 1, per_page: objStore.perPage \}\)/,
++  )
++  assert.match(list, /void refresh\(false, false\)/)
++  assert.match(read("store/obj.ts"), /if \(objStore.sourcePagination\) return/)
++  assert.match(
++    read("hooks/usePath.ts"),
++    /!sourcePagination\[path\] && hasHistory/,
++  )
++  assert.match(
++    read("store/history.ts"),
++    /if \(objStore.sourcePagination\) return/,
++  )
++})
++
++// Source checks stay lightweight and are intended for CI, not a production build.
++test("deep links request their explicit range without probing page one", () => {
++  const hook = readFileSync(new URL("../src/hooks/usePath.ts",import.meta.url),"utf8")
++  assert.match(hook,/const requestPage = index && index > 0 \? index : 1/)
++  assert.doesNotMatch(hook,/const explicit =/)
++})
++test("history restores continuation and actual appended page", () => {
++  const hook = readFileSync(new URL("../src/hooks/usePath.ts",import.meta.url),"utf8")
++  const history = readFileSync(new URL("../src/store/history.ts",import.meta.url),"utf8")
++  assert.match(hook,/globalHasMore = objStore.hasMore/)
++  assert.match(history,/page: objStore.page \|\| getGlobalPage\(\)/)
++})
+diff --git a/src/hooks/usePath.ts b/src/hooks/usePath.ts
+index 7039399..3ca8265 100644
+--- a/src/hooks/usePath.ts
++++ b/src/hooks/usePath.ts
+@@ -8,10 +8,10 @@ import {
+   State,
+   getPagination,
+   objStore,
+-  getHistoryKey,
+   hasHistory,
+   recoverHistory,
+-  clearHistory,
++  clearAllHistory,
++  getSortPreference,
+   me,
+ } from "~/store"
+ import {
+@@ -25,6 +25,15 @@ import {
+ import { useFetch } from "./useFetch"
+ import { useRouter } from "./useRouter"
+ 
++import {
++  boundedPageSize,
++  canLoadMore,
++  listPageState,
++  sortRequest,
++} from "~/utils/paging"
++
++// Path-scoped capabilities must not leak when navigating to another driver.
++const sourcePagination: Record<string, boolean> = {}
+ let first_fetch = true
+ 
+ let cancelObj: Canceler | undefined
+@@ -71,6 +80,9 @@ export const usePath = () => {
+   }
+ 
+   const clampPerPage = (size?: number) => {
++    if (sourcePagination[pathname()]) {
++      return boundedPageSize(size ?? perPageFromQuery() ?? objStore.perPage)
++    }
+     if (pagination.type === "all") {
+       return -1
+     }
+@@ -148,6 +160,7 @@ export const usePath = () => {
+         new axios.CancelToken((c) => {
+           cancelList = c
+         }),
++        sortRequest(getSortPreference(processedPath)),
+       )
+     },
+   )
+@@ -181,6 +194,7 @@ export const usePath = () => {
+     cancelPendingList(`path change: ${path}`)
+     globalHasMore = false
+     globalHasMoreKnown = false
++    ObjStore.set({ sourcePagination: sourcePagination[path] ?? false })
+ 
+     if (first_fetch) {
+       first_fetch = false
+@@ -217,8 +231,11 @@ export const usePath = () => {
+       return Promise.resolve()
+     }
+ 
+-    if (!force && hasHistory(path, index)) {
+-      return recoverHistory(path, index)
++    if (!force && !sourcePagination[path] && hasHistory(path, index)) {
++      return recoverHistory(path, index).then(() => {
++        globalHasMore = objStore.hasMore
++        globalHasMoreKnown = true
++      })
+     }
+ 
+     // 检查路径是否已知为目录
+@@ -248,6 +265,8 @@ export const usePath = () => {
+     handleRespWithoutNotify(
+       resp,
+       (data) => {
++        sourcePagination[path] = data.source_pagination === true
++        ObjStore.set({ sourcePagination: sourcePagination[path] })
+         ObjStore.setObj(data)
+         ObjStore.setProvider(data.provider)
+         ObjStore.setWebProxy(Boolean(data.web_proxy))
+@@ -274,6 +293,7 @@ export const usePath = () => {
+     append = false,
+     force?: boolean,
+   ) => {
++    // Honor explicit deep links before the provider capability is known, too.
+     const requestPage = index && index > 0 ? index : 1
+     const requestPerPage = clampPerPage(size)
+     cancelPendingList(`new fs/list: ${path}`)
+@@ -301,19 +321,23 @@ export const usePath = () => {
+     handleRespWithoutNotify(
+       resp,
+       (data) => {
+-        const responsePage =
+-          typeof data.page === "number" && data.page > 0
+-            ? data.page
+-            : requestPage
+-        const responsePerPage =
+-          typeof data.per_page === "number" && data.per_page > 0
+-            ? data.per_page
+-            : requestPerPage
+-        const filteredTotal = data.filtered_total ?? data.total ?? 0
+-        const hasMore =
+-          typeof data.has_more === "boolean"
+-            ? data.has_more
+-            : responsePage * responsePerPage < filteredTotal
++        const source = data.source_pagination ?? sourcePagination[path] ?? false
++        if (source && !sourcePagination[path]) clearAllHistory()
++        sourcePagination[path] = source
++        const {
++          page: responsePage,
++          perPage: responsePerPage,
++          total: filteredTotal,
++          hasMore,
++          totalExact,
++        } = listPageState(data, requestPage, requestPerPage)
++        ObjStore.set({
++          sourcePagination: source,
++          page: responsePage,
++          perPage: responsePerPage,
++          hasMore,
++          totalExact,
++        })
+         globalHasMore = hasMore
+         globalHasMoreKnown = true
+         if (perfEnabled) {
+@@ -329,8 +353,8 @@ export const usePath = () => {
+           })
+         }
+         setGlobalPage(responsePage)
+-        if (append) {
+-          appendObjs(data.content)
++        if (append && !source) {
++          appendObjs(data.content ?? [])
+         } else {
+           ObjStore.setObjs(data.content ?? [])
+         }
+@@ -427,7 +451,9 @@ export const usePath = () => {
+   }
+ 
+   const loadMore = () => {
+-    if (!globalHasMoreKnown || !globalHasMore) {
++    if (
++      !canLoadMore(objStore.sourcePagination, globalHasMoreKnown, globalHasMore)
++    ) {
+       return Promise.resolve()
+     }
+     return handleFolder(pathname(), globalPage + 1, undefined, true)
+@@ -439,7 +465,7 @@ export const usePath = () => {
+       const path = pathname()
+       cancelPendingObj(`refresh: ${path}`)
+       cancelPendingList(`refresh: ${path}`)
+-      clearHistory(path, globalPage)
++      clearAllHistory()
+       globalHasMore = false
+       globalHasMoreKnown = false
+       resetGlobalPage()
+diff --git a/src/pages/home/Obj.tsx b/src/pages/home/Obj.tsx
+index 49fc0c8..f19621c 100644
+--- a/src/pages/home/Obj.tsx
++++ b/src/pages/home/Obj.tsx
+@@ -12,7 +12,7 @@ import {
+ import { Error, FullLoading, LinkWithBase } from "~/components"
+ import { useObjTitle, usePath, useRouter, useT } from "~/hooks"
+ import {
+-  getPagination,
++  clearAllHistory,
+   objStore,
+   password,
+   recordHistory,
+@@ -34,27 +34,22 @@ export const Obj = () => {
+   const cardBg = useColorModeValue("white", "$neutral3")
+   const { pathname, searchParams } = useRouter()
+   const { handlePathChange, refresh } = usePath()
+-  const pagination = getPagination()
+-  const page = createMemo(() => {
+-    return pagination.type === "pagination"
+-      ? parseInt(searchParams["page"], 10) || 1
+-      : undefined
+-  })
+-  const perPage = createMemo(() => {
+-    if (pagination.type === "all") {
+-      return -1
+-    }
+-    return pagination.type === "pagination"
+-      ? parseInt(searchParams["per_page"], 10) || pagination.size
+-      : undefined
+-  })
++  // Read explicit navigation even if the site defaults to all/auto. usePath
++  // ignores these parameters for non-source drivers in those modes.
++  const page = createMemo(() => parseInt(searchParams["page"], 10) || 1)
++  const perPage = createMemo(
++    () => parseInt(searchParams["per_page"], 10) || undefined,
++  )
+   let lastPathname: string
+   let lastPage: number | undefined
++  let lastPerPage: number | undefined
+   createEffect(
+     on([pathname, page, perPage], async ([pathname, page, perPage]) => {
+-      if (lastPathname) {
++      if (lastPathname && lastPerPage === perPage) {
+         recordHistory(lastPathname, lastPage)
+       }
++      if (lastPerPage !== perPage) clearAllHistory()
++      lastPerPage = perPage
+       lastPathname = pathname
+       lastPage = page
+       useObjTitle()
+diff --git a/src/pages/home/folder/List.tsx b/src/pages/home/folder/List.tsx
+index f5cdf88..fb94617 100644
+--- a/src/pages/home/folder/List.tsx
++++ b/src/pages/home/folder/List.tsx
+@@ -1,8 +1,9 @@
+ import { HStack, VStack, Text } from "@hope-ui/solid"
+ import { batch, createEffect, createSignal, For, Show } from "solid-js"
+-import { useT } from "~/hooks"
++import { usePath, useRouter, useT } from "~/hooks"
+ import {
+   allChecked,
++  clearAllHistory,
+   checkboxOpen,
+   getCurrentPath,
+   getSortPreference,
+@@ -33,14 +34,6 @@ export const ListTitle = (props: {
+       setReverse(preference?.reverse ?? false)
+     })
+   })
+-  createEffect(() => {
+-    if (orderBy()) {
+-      const currentOrderBy = orderBy()!
+-      const currentReverse = reverse()
+-      props.sortCallback(currentOrderBy, currentReverse)
+-      setSortPreference(currentOrderBy, currentReverse, getCurrentPath())
+-    }
+-  })
+   const itemProps = (col: Col) => {
+     return {
+       fontWeight: "bold",
+@@ -57,6 +50,8 @@ export const ListTitle = (props: {
+             setReverse(false)
+           })
+         }
++        setSortPreference(orderBy()!, reverse(), getCurrentPath())
++        props.sortCallback(orderBy()!, reverse())
+       },
+     }
+   }
+@@ -89,6 +84,20 @@ export const ListTitle = (props: {
+ }
+ 
+ const ListLayout = () => {
++  const { refresh } = usePath()
++  const { searchParams, setSearchParams } = useRouter()
++  const sort = (orderBy: OrderBy, reverse?: boolean) => {
++    clearAllHistory()
++    if (!objStore.sourcePagination) {
++      sortObjs(orderBy, reverse)
++      return
++    }
++    if ((parseInt(searchParams["page"], 10) || 1) !== 1) {
++      setSearchParams({ page: 1, per_page: objStore.perPage })
++    } else {
++      void refresh(false, false)
++    }
++  }
+   const onDragOver = (e: DragEvent) => {
+     // 拖拽上传做权限检查限制
+     const writeIndex = UserPermissions.findIndex((item) => item === "write")
+@@ -117,7 +126,7 @@ const ListLayout = () => {
+       w="$full"
+       spacing="$1"
+     >
+-      <ListTitle sortCallback={sortObjs} />
++      <ListTitle sortCallback={sort} />
+       <For each={objStore.objs}>
+         {(obj, i) => {
+           return <ListItem obj={obj} index={i()} />
+diff --git a/src/pages/home/folder/Pager.tsx b/src/pages/home/folder/Pager.tsx
+index 08f7bba..b01a4e8 100644
+--- a/src/pages/home/folder/Pager.tsx
++++ b/src/pages/home/folder/Pager.tsx
+@@ -12,10 +12,12 @@ import {
+ } from "@hope-ui/solid"
+ import { createMemo, Match, onCleanup, onMount, Show, Switch } from "solid-js"
+ import { TbSelector } from "solid-icons/tb"
++import { pagingMode } from "~/utils/paging"
+ import { FullLoading, Paginator } from "~/components"
+ import { getGlobalPage, usePath, useRouter, useT } from "~/hooks"
+ import {
+   clearHistory,
++  clearAllHistory,
+   DEFAULT_PAGE_SIZE,
+   getPagination,
+   MAX_PAGE_SIZE,
+@@ -29,13 +31,7 @@ const Pagination = () => {
+   const pageSizeOptions = [50, 100, 200, 300, 500].filter(
+     (size) => size <= MAX_PAGE_SIZE,
+   )
+-  const currentPerPage = createMemo(() => {
+-    const value = parseInt(searchParams["per_page"], 10)
+-    if (Number.isFinite(value) && value > 0) {
+-      return Math.min(MAX_PAGE_SIZE, value)
+-    }
+-    return pagination.size || DEFAULT_PAGE_SIZE
+-  })
++  const currentPerPage = createMemo(() => objStore.perPage || DEFAULT_PAGE_SIZE)
+   return (
+     <HStack spacing="$2" flexWrap="wrap" justifyContent="center">
+       <HStack spacing="$1">
+@@ -45,7 +41,7 @@ const Pagination = () => {
+           defaultValue={currentPerPage()}
+           onChange={(value) => {
+             const perPage = Number(value)
+-            clearHistory(pathname(), 1)
++            clearAllHistory()
+             setSearchParams({ page: 1, per_page: perPage })
+           }}
+         >
+@@ -80,6 +76,54 @@ const Pagination = () => {
+     </HStack>
+   )
+ }
++// No exact total or visible-length heuristics: a filtered page can be empty
++// while the upstream still has another range to request.
++const SourcePagination = () => {
++  const { setSearchParams } = useRouter()
++  const go = (page: number, perPage = objStore.perPage) => {
++    clearAllHistory()
++    setSearchParams({ page, per_page: perPage })
++  }
++  return (
++    <HStack spacing="$2" flexWrap="wrap" justifyContent="center">
++      <Select
++        size="sm"
++        value={objStore.perPage}
++        onChange={(value) => go(1, Number(value))}
++      >
++        <SelectTrigger as={Button} size="sm" variant="subtle" minW="$20">
++          <Box>{objStore.perPage}</Box>
++          <TbSelector />
++        </SelectTrigger>
++        <SelectContent minW="$20">
++          <SelectListbox>
++            {[...new Set([50, 100, 200, 300, 500, objStore.perPage])]
++              .sort((a, b) => a - b)
++              .map((size) => (
++                <SelectOption value={size}>
++                  <SelectOptionText>{size}</SelectOptionText>
++                </SelectOption>
++              ))}
++          </SelectListbox>
++        </SelectContent>
++      </Select>
++      <Button
++        disabled={objStore.page <= 1}
++        onClick={() => go(objStore.page - 1)}
++      >
++        Previous
++      </Button>
++      <Text>Page {objStore.page}</Text>
++      <Button
++        disabled={!objStore.hasMore}
++        onClick={() => go(objStore.page + 1)}
++      >
++        Next
++      </Button>
++    </HStack>
++  )
++}
++
+ const LoadMore = () => {
+   const { loadMore, allLoaded } = usePath()
+   const t = useT()
+@@ -132,7 +176,15 @@ export const Pager = () => {
+       <Match when={objStore.state === State.FetchingMore}>
+         <FullLoading py="$2" size="md" thickness={3} />
+       </Match>
+-      <Match when={pagination.type === "pagination"}>
++      <Match when={objStore.sourcePagination}>
++        <SourcePagination />
++      </Match>
++      <Match
++        when={
++          pagingMode(objStore.sourcePagination, pagination.type) ===
++          "pagination"
++        }
++      >
+         <Pagination />
+       </Match>
+       <Match when={pagination.type === "load_more"}>
+diff --git a/src/store/history.ts b/src/store/history.ts
+index fc023c6..764262f 100644
+--- a/src/store/history.ts
++++ b/src/store/history.ts
+@@ -19,6 +19,7 @@ export const getHistoryKey = (path: string, page?: number) => {
+ }
+ 
+ export const recordHistory = (path: string, page?: number) => {
++  if (objStore.sourcePagination) return
+   const obj = JSON.parse(JSON.stringify(objStore))
+   if (
+     ![State.FetchingMore, State.Folder, State.File].includes(objStore.state)
+@@ -31,7 +32,7 @@ export const recordHistory = (path: string, page?: number) => {
+   const key = getHistoryKey(path, page)
+   const history = {
+     obj,
+-    page: page ?? getGlobalPage(),
++    page: objStore.page || getGlobalPage(),
+     scroll: window.scrollY,
+   }
+   HistoryMap.set(key, history)
+diff --git a/src/store/obj.ts b/src/store/obj.ts
+index 4ce21d6..8137073 100644
+--- a/src/store/obj.ts
++++ b/src/store/obj.ts
+@@ -25,6 +25,11 @@ const [objStore, setObjStore] = createStore<{
+ 
+   objs: StoreObj[]
+   total: number
++  sourcePagination: boolean
++  page: number
++  perPage: number
++  hasMore: boolean
++  totalExact: boolean
+   write?: boolean
+ 
+   readme: string
+@@ -42,6 +47,11 @@ const [objStore, setObjStore] = createStore<{
+ 
+   objs: [],
+   total: 0,
++  sourcePagination: false,
++  page: 1,
++  perPage: 50,
++  hasMore: false,
++  totalExact: true,
+ 
+   readme: "",
+   header: "",
+@@ -102,6 +112,7 @@ export const ObjStore = {
+ export type OrderBy = "name" | "size" | "modified"
+ 
+ export const sortObjs = (orderBy: OrderBy, reverse?: boolean) => {
++  if (objStore.sourcePagination) return
+   log("sort:", orderBy, reverse)
+   naturalSort.insensitive = true
+   setObjStore(
+diff --git a/src/types/resp.ts b/src/types/resp.ts
+index 661528c..f8c26d0 100644
+--- a/src/types/resp.ts
++++ b/src/types/resp.ts
+@@ -14,6 +14,8 @@ export type PageResp<T> = Resp<{
+ export type FsListResp = Resp<{
+   content: Obj[]
+   total: number
++  source_pagination?: boolean
++  total_exact?: boolean
+   filtered_total?: number
+   page?: number
+   per_page?: number
+@@ -43,6 +45,7 @@ export type FsGetResp = Resp<
+     header: string
+     provider: string
+     web_proxy?: boolean
++    source_pagination?: boolean
+     related: Obj[]
+   }
+ >
+diff --git a/src/utils/api.ts b/src/utils/api.ts
+index dd8297d..cdd2605 100644
+--- a/src/utils/api.ts
++++ b/src/utils/api.ts
+@@ -45,6 +45,10 @@ export const fsList = (
+   per_page = DEFAULT_PAGE_SIZE,
+   refresh = false,
+   cancelToken?: CancelToken,
++  sort?: {
++    order_by?: "name" | "size" | "modified"
++    order_direction?: "asc" | "desc"
++  },
+ ): Promise<FsListResp> => {
+   return r.post(
+     "/fs/list",
+@@ -54,6 +58,7 @@ export const fsList = (
+       page,
+       per_page,
+       refresh,
++      ...sort,
+     },
+     {
+       cancelToken: cancelToken,
+diff --git a/src/utils/paging.ts b/src/utils/paging.ts
+new file mode 100644
+index 0000000..a82e15a
+--- /dev/null
++++ b/src/utils/paging.ts
+@@ -0,0 +1,50 @@
++// Source pagination is always explicit, even when the site requests all/auto.
++export const pagingMode = (source: boolean, configured: string) =>
++  source ? "pagination" : configured
++
++export const boundedPageSize = (size?: number) =>
++  Number.isFinite(size) && size! > 0
++    ? Math.min(500, Math.max(1, Math.floor(size!)))
++    : 50
++
++export const listPageState = (
++  data: {
++    page?: number
++    per_page?: number
++    has_more?: boolean
++    total?: number
++    filtered_total?: number
++    total_exact?: boolean
++  },
++  page: number,
++  perPage: number,
++) => {
++  const actualPage = data.page && data.page > 0 ? data.page : page
++  const actualSize =
++    data.per_page && data.per_page > 0 ? data.per_page : perPage
++  const total = data.filtered_total ?? data.total ?? 0
++  return {
++    page: actualPage,
++    perPage: actualSize,
++    // Never infer the end from visible content: filtering can empty a page.
++    hasMore: data.has_more ?? actualPage * actualSize < total,
++    total,
++    totalExact: data.total_exact !== false,
++  }
++}
++
++export const sortRequest = (preference?: {
++  orderBy: "name" | "size" | "modified"
++  reverse: boolean
++}) =>
++  preference
++    ? {
++        order_by: preference.orderBy,
++        order_direction: preference.reverse
++          ? ("desc" as const)
++          : ("asc" as const),
++      }
++    : {}
++
++export const canLoadMore = (source: boolean, known: boolean, more: boolean) =>
++  !source && known && more

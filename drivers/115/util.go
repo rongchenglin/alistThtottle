@@ -56,6 +56,7 @@ func (d *Pan115) login() error {
 		},
 	}
 	d.client = driver115.New(opts...)
+	d.configureClient()
 	cr := &driver115.Credential{}
 	if d.QRCodeToken != "" {
 		s := &driver115.QRCodeSession{
@@ -77,12 +78,12 @@ func (d *Pan115) login() error {
 	return d.client.LoginCheck()
 }
 
-func (d *Pan115) getFiles(fileId string) ([]FileObj, error) {
+func (d *Pan115) getFiles(ctx context.Context, fileId string) ([]FileObj, error) {
 	res := make([]FileObj, 0)
-	if d.PageSize <= 0 {
-		d.PageSize = driver115.FileListLimit
-	}
 	limit := d.PageSize
+	if limit <= 0 {
+		limit = driver115.FileListLimit
+	}
 	if limit > driver115.MaxDirPageLimit {
 		limit = driver115.MaxDirPageLimit
 	}
@@ -95,17 +96,21 @@ func (d *Pan115) getFiles(fileId string) ([]FileObj, error) {
 
 	offset := int64(0)
 	for i := 0; ; i++ {
-		result, err := d.getFilesPageWithThumb(fileId, opts.ApiURLs[i%len(opts.ApiURLs)], limit, offset)
+		result, err := d.getFilesPageWithThumb(ctx, fileId, opts.ApiURLs[i%len(opts.ApiURLs)], limit, offset)
 		if err != nil {
 			return nil, err
 		}
 		for _, fileInfo := range result.Files {
 			res = append(res, fileObjFromInfo(&fileInfo))
 		}
-		offset = int64(result.Offset) + limit
-		if offset >= int64(result.Count) {
+		next := offset + int64(len(result.Files))
+		if next >= int64(result.Count) {
 			break
 		}
+		if next <= offset {
+			return nil, errors.Wrap(driver115.ErrUnexpected, "115 returned an empty page before the end of the directory")
+		}
+		offset = next
 	}
 
 	return res, nil
@@ -158,7 +163,7 @@ func (d *Pan115) getFileInfoWithThumb(queryKey, queryVal string) (*fileInfoWithT
 	return result.Files[0], nil
 }
 
-func (d *Pan115) getFilesPageWithThumb(dirID, apiURL string, limit, offset int64) (*fileListRespWithThumb, error) {
+func (d *Pan115) getFilesPageWithThumb(ctx context.Context, dirID, apiURL string, limit, offset int64, overrides ...map[string]string) (*fileListRespWithThumb, error) {
 	if dirID == "" {
 		dirID = "0"
 	}
@@ -177,15 +182,27 @@ func (d *Pan115) getFilesPageWithThumb(dirID, apiURL string, limit, offset int64
 		"format":           "json",
 		"fc_mix":           "0",
 	}
-	req := d.client.NewRequest().
+	for _, override := range overrides {
+		for key, value := range override {
+			params[key] = value
+		}
+	}
+	req := d.client.Client.R().
+		SetContext(ctx).
 		ForceContentType("application/json;charset=UTF-8").
 		SetQueryParams(params).
 		SetResult(&result)
 	resp, err := req.Get(apiURL)
+	// Error envelopes can differ from the normal result and fail SDK unmarshalling.
+	if resp != nil {
+		if throttleErr := d.checkThrottleResponse(resp.Body(), resp.Header().Get("Retry-After")); throttleErr != nil {
+			return nil, throttleErr
+		}
+	}
 	if err := driver115.CheckErr(err, &result, resp); err != nil {
 		return nil, err
 	}
-	if dirID != string(result.CategoryID) {
+	if dirID != string(result.CategoryID) || int64(result.Offset) != offset {
 		return nil, driver115.ErrUnexpected
 	}
 	return &result, nil
@@ -262,6 +279,9 @@ func (d *Pan115) rapidUpload(fileSize int64, fileName, dirID, preID, fileID stri
 			return nil, err
 		}
 		if decrypted, err = ecdhCipher.Decrypt(bodyBytes); err != nil {
+			return nil, err
+		}
+		if err = d.checkThrottleResponse(decrypted, resp.Header().Get("Retry-After")); err != nil {
 			return nil, err
 		}
 		if err = driver115.CheckErr(json.Unmarshal(decrypted, &result), &result, resp); err != nil {

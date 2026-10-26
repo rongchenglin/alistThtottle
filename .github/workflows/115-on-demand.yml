@@ -1,0 +1,54 @@
+name: 115 on-demand pagination (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 115-on-demand-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+      GOMAXPROCS: '2'
+      GOMEMLIMIT: 1GiB
+      NODE_OPTIONS: --max-old-space-size=2048
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Enable pinned pnpm via Corepack
+        run: corepack enable
+      - name: Validate shell syntax
+        run: bash -n scripts/build-paged-web.sh
+      - name: Test paginated backend (mock HTTP only)
+        run: go test -p 1 -tags=jsoniter ./drivers/115 ./internal/op ./internal/fs ./server/handles
+      - name: Check paginated code with race detector
+        run: go test -race -p 1 -tags=jsoniter ./drivers/115 ./internal/op ./internal/fs ./server/handles -run 'Test(ListPage|PagedGetter|FsListUsesOnlyRequestedUpstreamPage|SourcePageArgs|GetDirectory|PageObject|Cold|ListThrottles|ConcurrentLists|NonPositive|ListCancels|ListStops|Cooldown|Queued|Decoded|NormalResponse|ListRejects|ListUses|ListDeadline)'
+      - name: Build pinned patched frontend (after Go tests finish)
+        run: bash scripts/build-paged-web.sh
+      - name: Build backend with patched UI embedded
+        run: |
+          mkdir -p output
+          go build -p 1 -tags=jsoniter -trimpath -ldflags="-s -w -X github.com/alist-org/alist/v3/internal/conf.Version=115-on-demand-${GITHUB_SHA:0:8} -X github.com/alist-org/alist/v3/internal/conf.WebVersion=115-on-demand" -o output/alist .
+          tar -czf output/alist-linux-amd64.tar.gz -C output alist
+          sha256sum output/alist-linux-amd64.tar.gz > output/SHA256SUMS
+      - name: Upload experimental binary and matching frontend
+        uses: actions/upload-artifact@v4
+        with:
+          name: alist-115-on-demand-${{ github.sha }}
+          path: |
+            output/alist-linux-amd64.tar.gz
+            output/SHA256SUMS
+            public/dist/
+          if-no-files-found: error

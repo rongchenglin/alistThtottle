@@ -13,7 +13,22 @@ var _ model.Obj = (*FileObj)(nil)
 type FileObj struct {
 	driver.File
 	ThumbURL string
+	Path     string
 }
+
+func (f *FileObj) CloneObj() model.Obj {
+	clone := *f
+	clone.Labels = make([]*driver.Label, len(f.Labels))
+	for i, label := range f.Labels {
+		if label != nil {
+			copied := *label
+			clone.Labels[i] = &copied
+		}
+	}
+	return &clone
+}
+
+func (f *FileObj) GetPath() string { return f.Path }
 
 func (f *FileObj) CreateTime() time.Time {
 	return f.File.CreateTime

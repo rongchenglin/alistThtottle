@@ -38,6 +38,17 @@ type Reader interface {
 	Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error)
 }
 
+// PagedReader is optional. Its Getter errors are authoritative: resolving a
+// path must never fall back to scanning a complete parent directory.
+type PagedReader interface {
+	ListPage(ctx context.Context, dir model.Obj, args model.PageListArgs) (*model.PageList, error)
+}
+
+// PageObjectInvalidator lets page-cache refreshes discard driver lookup hints.
+type PageObjectInvalidator interface {
+	InvalidatePageObjects()
+}
+
 type GetRooter interface {
 	GetRoot(ctx context.Context) (model.Obj, error)
 }

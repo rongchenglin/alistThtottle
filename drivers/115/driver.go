@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
+	"github.com/Xhofe/go-cache"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/pkg/http_range"
@@ -18,9 +20,15 @@ import (
 type Pan115 struct {
 	model.Storage
 	Addition
-	client     *driver115.Pan115Client
-	limiter    *rate.Limiter
-	appVerOnce sync.Once
+	client           *driver115.Pan115Client
+	limiter          *rate.Limiter
+	appVerOnce       sync.Once
+	cooldownMu       sync.Mutex
+	cooldownUntil    time.Time
+	cooldownChanged  chan struct{}
+	objectMu         sync.Mutex
+	pageObjects      cache.ICache[model.Obj]
+	objectGeneration uint64
 }
 
 func (d *Pan115) Config() driver.Config {
@@ -33,17 +41,8 @@ func (d *Pan115) GetAddition() driver.Additional {
 
 func (d *Pan115) Init(ctx context.Context) error {
 	d.appVerOnce.Do(d.initAppVer)
-	if d.LimitRate > 0 {
-		d.limiter = rate.NewLimiter(rate.Limit(d.LimitRate), 1)
-	}
+	d.InvalidatePageObjects()
 	return d.login()
-}
-
-func (d *Pan115) WaitLimit(ctx context.Context) error {
-	if d.limiter != nil {
-		return d.limiter.Wait(ctx)
-	}
-	return nil
 }
 
 func (d *Pan115) Drop(ctx context.Context) error {
@@ -51,10 +50,10 @@ func (d *Pan115) Drop(ctx context.Context) error {
 }
 
 func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
+	if args.Refresh {
+		d.InvalidatePageObjects()
 	}
-	files, err := d.getFiles(dir.GetID())
+	files, err := d.getFiles(ctx, dir.GetID())
 	if err != nil && !errors.Is(err, driver115.ErrNotExist) {
 		return nil, err
 	}
@@ -64,7 +63,7 @@ func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) (
 }
 
 func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.checkRequest(ctx); err != nil {
 		return nil, err
 	}
 	userAgent := ""
@@ -93,7 +92,9 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 }
 
 func (d *Pan115) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	d.InvalidatePageObjects()
+	defer d.InvalidatePageObjects()
+	if err := d.checkRequest(ctx); err != nil {
 		return nil, err
 	}
 
@@ -121,7 +122,9 @@ func (d *Pan115) MakeDir(ctx context.Context, parentDir model.Obj, dirName strin
 }
 
 func (d *Pan115) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	d.InvalidatePageObjects()
+	defer d.InvalidatePageObjects()
+	if err := d.checkRequest(ctx); err != nil {
 		return nil, err
 	}
 	if err := d.client.Move(dstDir.GetID(), srcObj.GetID()); err != nil {
@@ -135,7 +138,9 @@ func (d *Pan115) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj,
 }
 
 func (d *Pan115) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	d.InvalidatePageObjects()
+	defer d.InvalidatePageObjects()
+	if err := d.checkRequest(ctx); err != nil {
 		return nil, err
 	}
 	if err := d.client.Rename(srcObj.GetID(), newName); err != nil {
@@ -149,21 +154,27 @@ func (d *Pan115) Rename(ctx context.Context, srcObj model.Obj, newName string) (
 }
 
 func (d *Pan115) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
-	if err := d.WaitLimit(ctx); err != nil {
+	d.InvalidatePageObjects()
+	defer d.InvalidatePageObjects()
+	if err := d.checkRequest(ctx); err != nil {
 		return err
 	}
 	return d.client.Copy(dstDir.GetID(), srcObj.GetID())
 }
 
 func (d *Pan115) Remove(ctx context.Context, obj model.Obj) error {
-	if err := d.WaitLimit(ctx); err != nil {
+	d.InvalidatePageObjects()
+	defer d.InvalidatePageObjects()
+	if err := d.checkRequest(ctx); err != nil {
 		return err
 	}
 	return d.client.Delete(obj.GetID())
 }
 
 func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	d.InvalidatePageObjects()
+	defer d.InvalidatePageObjects()
+	if err := d.checkRequest(ctx); err != nil {
 		return nil, err
 	}
 
@@ -246,6 +257,9 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 }
 
 func (d *Pan115) OfflineList(ctx context.Context) ([]*driver115.OfflineTask, error) {
+	if err := d.checkRequest(ctx); err != nil {
+		return nil, err
+	}
 	resp, err := d.client.ListOfflineTask(0)
 	if err != nil {
 		return nil, err
@@ -254,10 +268,16 @@ func (d *Pan115) OfflineList(ctx context.Context) ([]*driver115.OfflineTask, err
 }
 
 func (d *Pan115) OfflineDownload(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
+	if err := d.checkRequest(ctx); err != nil {
+		return nil, err
+	}
 	return d.client.AddOfflineTaskURIs(uris, dstDir.GetID(), driver115.WithAppVer(appVer))
 }
 
 func (d *Pan115) DeleteOfflineTasks(ctx context.Context, hashes []string, deleteFiles bool) error {
+	if err := d.checkRequest(ctx); err != nil {
+		return err
+	}
 	return d.client.DeleteOfflineTasks(hashes, deleteFiles)
 }
 
