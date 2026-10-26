@@ -51,14 +51,14 @@
 
 当前源码仍为待验证版本；最近这一轮按要求没有运行构建、测试编译、竞态检查或依赖安装。不能沿用早前限流补丁的成功结果声称本次完整分页改动已通过。
 
-推荐在 fork 的 GitHub Actions 选择 **115 on-demand pagination (manual)**，手动执行：
+面向 `main` 的 PR 创建、更新后，GitHub Actions 的 **115 on-demand pagination (PR and manual)** 自动执行以下验证；合并后也可从默认分支手动触发：
 
 1. 本地模拟的后端分页/权限/缓存测试。
 2. 后端相关竞态检查。
 3. 固定版本配套前端及离线测试。
 4. 将配套 UI 嵌入 Linux amd64 后端并上传实验性产物及 SHA256 校验。
 
-此工作流只有 `workflow_dispatch`，提交代码不会自动触发它；本次没有触发远程构建。Go 测试和前端构建串行执行。工作流不读取你的 AList 数据、Cookie 或真实 115 账号。
+此工作流使用 `pull_request` 和 `workflow_dispatch`，无需先合并分页代码就能在 PR 中验证。它只在 GitHub 托管机器上运行，权限为 `contents: read`，不发布、不部署。Go 测试和前端构建串行执行；工作流不读取你的 AList 数据、Cookie 或真实 115 账号。本机不执行这些构建。
 
 本地前端构建脚本默认拒绝执行；即使显式允许，也要求至少 3 GiB 可用 RAM，容器内存上限至少 4 GiB，不将 Swap 算作安全余量。Node 堆上限不是整个进程组的内存上限，不能据此在小内存线上服务器构建。
 

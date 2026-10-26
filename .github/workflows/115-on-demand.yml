@@ -1,6 +1,8 @@
-name: 115 on-demand pagination (manual)
+name: 115 on-demand pagination (PR and manual)
 
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
